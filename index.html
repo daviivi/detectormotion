@@ -1,0 +1,1280 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0, minimum-scale=1.0, viewport-fit=cover">
+  <title>Motion Detector - Detecção de Movimento</title>
+  
+  <!-- iOS Safari specific -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Motion Detector">
+  <meta name="apple-touch-fullscreen" content="yes">
+  
+  <!-- Android Chrome specific -->
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="theme-color" content="#1e3a8a">
+  <meta name="msapplication-navbutton-color" content="#1e3a8a">
+  
+  <!-- Prevent zoom on input focus -->
+  <meta name="format-detection" content="telephone=no">
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.4.2/p5.min.js"></script>
+  
+  <script>
+    // Global variables
+    let capture;
+    let video;
+    let previousFrame;
+    let motionThreshold = 25;
+    let currentSource = 'webcam';
+    let isVideoPlaying = false;
+    let uploadedVideo = null;
+    let canvasWidth = 320;
+    let canvasHeight = 240;
+    let isAppStarted = false;
+    let cameraPermissionDenied = false;
+    let isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+    let isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+    let cameraAttempts = 0;
+    let maxCameraAttempts = 3;
+    let mediaStream = null;
+
+    // Check if HTTPS is required
+    function checkHTTPS() {
+      const isLocalhost = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+      const isHTTPS = location.protocol === 'https:';
+      
+      if (!isLocalhost && !isHTTPS) {
+        updateStatus('⚠️ HTTPS necessário para câmera', 'error');
+        showHTTPSError();
+        return false;
+      }
+      return true;
+    }
+
+    // Start the application
+    window.startApp = function() {
+      if (!checkHTTPS()) {
+        return;
+      }
+      
+      const welcomeScreen = document.getElementById('welcomeScreen');
+      welcomeScreen.classList.add('hidden');
+      isAppStarted = true;
+      
+      setTimeout(() => {
+        welcomeScreen.style.display = 'none';
+        initializeApp();
+      }, 500);
+    };
+
+    // Switch between camera and video upload
+    window.switchSource = function(source) {
+      currentSource = source;
+      
+      // Update tab buttons
+      document.querySelectorAll('.tab-button').forEach(tab => {
+        tab.classList.remove('active');
+      });
+      document.getElementById(`${source}-tab`).classList.add('active');
+      
+      const uploadSection = document.getElementById('video-upload-section');
+      const videoControls = document.getElementById('video-controls');
+      
+      if (source === 'video') {
+        uploadSection.style.display = 'block';
+        videoControls.style.display = 'none';
+        updateStatus('📁 Faça upload de um vídeo para começar', 'loading');
+        stopCamera();
+      } else {
+        uploadSection.style.display = 'none';
+        videoControls.style.display = 'none';
+        if (!cameraPermissionDenied && checkHTTPS()) {
+          initializeWebcam();
+        } else {
+          updateStatus('❌ Câmera não disponível', 'error');
+          showCameraHelp();
+        }
+      }
+      
+      clearErrorMessage();
+    };
+
+    // Stop camera stream properly
+    function stopCamera() {
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(track => {
+          track.stop();
+        });
+        mediaStream = null;
+      }
+      
+      if (capture) {
+        capture.remove();
+        capture = null;
+      }
+    }
+
+    // Handle video upload
+    window.handleVideoUpload = function(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      
+      if (!file.type.startsWith('video/')) {
+        showErrorMessage('⚠️ Por favor, selecione um arquivo de vídeo válido.');
+        return;
+      }
+      
+      updateStatus('⏳ Carregando vídeo...', 'loading');
+      clearErrorMessage();
+      stopCamera();
+      
+      try {
+        if (uploadedVideo) {
+          uploadedVideo.remove();
+        }
+        
+        uploadedVideo = createVideo(URL.createObjectURL(file));
+        uploadedVideo.size(canvasWidth, canvasHeight);
+        uploadedVideo.hide();
+        
+        uploadedVideo.elt.addEventListener('loadeddata', () => {
+          updateStatus('✅ Vídeo carregado - Pressione Play', 'ready');
+          document.getElementById('video-controls').style.display = 'flex';
+        });
+        
+        uploadedVideo.elt.addEventListener('ended', () => {
+          isVideoPlaying = false;
+          updatePlayPauseButton();
+          updateStatus('🏁 Vídeo finalizado', 'ready');
+        });
+        
+        uploadedVideo.elt.addEventListener('error', () => {
+          showErrorMessage('❌ Erro ao carregar vídeo. Tente outro formato.');
+        });
+        
+      } catch (error) {
+        console.error('Video loading failed:', error);
+        showErrorMessage('❌ Erro ao carregar vídeo. Tente outro formato.');
+      }
+    };
+
+    // Video controls
+    window.togglePlayPause = function() {
+      if (!uploadedVideo) return;
+      
+      if (isVideoPlaying) {
+        uploadedVideo.pause();
+        isVideoPlaying = false;
+        updateStatus('⏸️ Vídeo pausado', 'ready');
+      } else {
+        uploadedVideo.play();
+        isVideoPlaying = true;
+        updateStatus('▶️ Reproduzindo - Detectando movimento...', 'ready');
+      }
+      
+      updatePlayPauseButton();
+    };
+
+    window.restartVideo = function() {
+      if (!uploadedVideo) return;
+      
+      uploadedVideo.time(0);
+      if (isVideoPlaying) {
+        uploadedVideo.play();
+      }
+      updateStatus('🔄 Vídeo reiniciado', 'ready');
+    };
+
+    // Initialize application
+    function initializeApp() {
+      updateStatus('🚀 Inicializando...', 'loading');
+      adjustCanvasSize();
+      
+      setTimeout(() => {
+        if (currentSource === 'webcam') {
+          initializeWebcam();
+        }
+      }, 1000);
+    }
+
+    // Adjust canvas size for mobile
+    function adjustCanvasSize() {
+      const containerWidth = Math.min(window.innerWidth - 40, 600);
+      const aspectRatio = 4/3;
+      
+      canvasWidth = containerWidth;
+      canvasHeight = Math.floor(containerWidth / aspectRatio);
+      
+      // Ensure minimum usable size
+      if (canvasWidth < 240) {
+        canvasWidth = 240;
+        canvasHeight = 180;
+      }
+      
+      // Maximum size for performance
+      if (canvasWidth > 480) {
+        canvasWidth = 480;
+        canvasHeight = 360;
+      }
+    }
+
+    // Update status display
+    function updateStatus(message, type = 'loading') {
+      const statusElement = document.getElementById('status');
+      statusElement.innerHTML = `<span class="status-indicator status-${type}"></span>${message}`;
+    }
+
+    // Initialize webcam with robust error handling
+    async function initializeWebcam() {
+      if (cameraAttempts >= maxCameraAttempts) {
+        cameraPermissionDenied = true;
+        updateStatus('❌ Muitas tentativas falhas', 'error');
+        showCameraHelp();
+        return;
+      }
+      
+      cameraAttempts++;
+      updateStatus('📹 Solicitando acesso à câmera...', 'loading');
+      showCameraPermissionGuide();
+      stopCamera();
+      
+      try {
+        // Check if getUserMedia is available
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          throw new Error('getUserMedia não suportado');
+        }
+        
+        // Mobile-optimized constraints
+        const constraints = {
+          video: {
+            width: { ideal: canvasWidth, max: 640 },
+            height: { ideal: canvasHeight, max: 480 },
+            facingMode: isMobile ? 'environment' : 'user',
+            frameRate: { ideal: 15, max: 20 }
+          },
+          audio: false
+        };
+        
+        // For iOS, try simplified constraints first
+        if (isIOS && cameraAttempts === 1) {
+          constraints.video = {
+            facingMode: 'environment',
+            width: { max: 480 },
+            height: { max: 360 }
+          };
+        }
+        
+        // Get media stream first
+        mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+        
+        // Create p5.js capture from stream
+        capture = createCapture(VIDEO, (stream) => {
+          console.log('Camera initialized successfully');
+          updateStatus('✅ Câmera ativa - Detectando movimento...', 'ready');
+          clearErrorMessage();
+          cameraPermissionDenied = false;
+          cameraAttempts = 0; // Reset on success
+        });
+        
+        capture.size(canvasWidth, canvasHeight);
+        capture.hide();
+        
+        // Additional checks for mobile
+        setTimeout(() => {
+          if (capture && capture.elt) {
+            if (capture.elt.videoWidth > 0 && capture.elt.videoHeight > 0) {
+              updateStatus('✅ Câmera funcionando perfeitamente!', 'ready');
+              clearErrorMessage();
+            } else {
+              // Try again with different constraints
+              if (cameraAttempts < maxCameraAttempts) {
+                setTimeout(initializeWebcam, 1000);
+              }
+            }
+          }
+        }, 3000);
+        
+      } catch (error) {
+        console.error('Camera access failed:', error);
+        handleCameraError(error);
+      }
+    }
+
+    // Handle camera errors specifically
+    function handleCameraError(error) {
+      let errorMessage = '';
+      
+      switch(error.name) {
+        case 'NotAllowedError':
+          errorMessage = '❌ Permissão negada pelo usuário';
+          cameraPermissionDenied = true;
+          break;
+        case 'NotFoundError':
+          errorMessage = '❌ Câmera não encontrada no dispositivo';
+          cameraPermissionDenied = true;
+          break;
+        case 'NotReadableError':
+          errorMessage = '❌ Câmera sendo usada por outro app';
+          break;
+        case 'OverconstrainedError':
+          errorMessage = '❌ Configurações não suportadas';
+          break;
+        case 'SecurityError':
+          errorMessage = '❌ HTTPS necessário ou origem não segura';
+          break;
+        default:
+          errorMessage = `❌ Erro de câmera: ${error.message}`;
+          break;
+      }
+      
+      updateStatus(errorMessage, 'error');
+      
+      // Try again with fallback constraints
+      if (cameraAttempts < maxCameraAttempts && !cameraPermissionDenied) {
+        setTimeout(() => {
+          initializeWebcamFallback();
+        }, 2000);
+      } else {
+        showCameraHelp();
+      }
+    }
+
+    // Fallback camera initialization with minimal constraints
+    async function initializeWebcamFallback() {
+      try {
+        updateStatus('🔄 Tentando configuração alternativa...', 'loading');
+        
+        const fallbackConstraints = {
+          video: true, // Minimal constraints
+          audio: false
+        };
+        
+        mediaStream = await navigator.mediaDevices.getUserMedia(fallbackConstraints);
+        
+        capture = createCapture(VIDEO);
+        capture.size(canvasWidth, canvasHeight);
+        capture.hide();
+        
+        setTimeout(() => {
+          if (capture && capture.elt && capture.elt.videoWidth > 0) {
+            updateStatus('✅ Câmera ativa (modo compatibilidade)', 'ready');
+            clearErrorMessage();
+            cameraPermissionDenied = false;
+          }
+        }, 2000);
+        
+      } catch (error) {
+        handleCameraError(error);
+      }
+    }
+
+    // Show camera permission guide
+    function showCameraPermissionGuide() {
+      const container = document.getElementById('error-container');
+      container.innerHTML = `
+        <div class="info-message">
+          <div style="font-size: 2rem; margin-bottom: 10px;">📹</div>
+          <h3 style="margin: 0 0 10px 0; color: #00ff88;">Acesso à Câmera</h3>
+          <p style="margin: 5px 0;">Quando solicitado, clique em <strong>"Permitir"</strong></p>
+          ${isMobile ? 
+            '<p style="margin: 5px 0; font-size: 0.9rem;">📱 No mobile: pode aparecer um popup ou ícone na barra</p>' : 
+            '<p style="margin: 5px 0; font-size: 0.9rem;">💻 Procure o ícone de câmera na barra de endereços</p>'
+          }
+        </div>
+      `;
+    }
+
+    // Show camera help with detailed instructions
+    function showCameraHelp() {
+      const container = document.getElementById('error-container');
+      
+      const mobileInstructions = `
+        📱 <strong>Instruções para Mobile:</strong><br>
+        • Atualize a página e clique em "Permitir" na popup<br>
+        • Verifique se outro app não está usando a câmera<br>
+        • Tente fechar outras abas do navegador<br>
+        • Use Chrome ou Safari (navegadores recomendados)<br>
+        • Acesse via HTTPS se possível<br>
+        • Reinicie o navegador se necessário<br><br>
+      `;
+      
+      const desktopInstructions = `
+        💻 <strong>Instruções para Desktop:</strong><br>
+        • Clique no ícone de câmera na barra de endereços<br>
+        • Selecione "Sempre permitir" para este site<br>
+        • Atualize a página após permitir<br>
+        • Verifique se outro programa não está usando a câmera<br><br>
+      `;
+      
+      container.innerHTML = `
+        <div class="error-message">
+          <div style="font-size: 1.5rem; margin-bottom: 15px;">🚫 Câmera Inacessível</div>
+          <div style="text-align: left; margin: 15px 0; font-size: 0.9rem; line-height: 1.4;">
+            ${isMobile ? mobileInstructions : desktopInstructions}
+            🎬 <strong>Alternativa:</strong> Use "Upload Vídeo" para testar a detecção
+          </div>
+          <div style="display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; margin-top: 15px;">
+            <button onclick="window.location.reload()" class="help-button primary">
+              🔄 Recarregar Página
+            </button>
+            <button onclick="window.switchSource('video')" class="help-button secondary">
+              🎬 Upload Vídeo
+            </button>
+          </div>
+        </div>
+      `;
+    }
+
+    // Show HTTPS error
+    function showHTTPSError() {
+      const container = document.getElementById('error-container');
+      container.innerHTML = `
+        <div class="error-message">
+          <div style="font-size: 1.5rem; margin-bottom: 15px;">🔒 HTTPS Necessário</div>
+          <p>Para acessar a câmera, este site precisa ser carregado via HTTPS.</p>
+          <p><strong>Soluções:</strong></p>
+          <p>• Execute localmente (localhost)</p>
+          <p>• Use um servidor HTTPS</p>
+          <p>• Ou teste com a opção "Upload Vídeo"</p>
+          <button onclick="window.switchSource('video')" class="help-button secondary" style="margin-top: 15px;">
+            🎬 Usar Upload Vídeo
+          </button>
+        </div>
+      `;
+    }
+
+    // Utility functions
+    function updatePlayPauseButton() {
+      const btn = document.getElementById('play-pause-btn');
+      btn.innerHTML = isVideoPlaying ? '⏸️ Pausar' : '▶️ Play';
+    }
+
+    function showErrorMessage(message) {
+      const container = document.getElementById('error-container');
+      container.innerHTML = `<div class="error-message">${message}</div>`;
+    }
+
+    function clearErrorMessage() {
+      document.getElementById('error-container').innerHTML = '';
+    }
+
+    // Drag and drop functionality
+    function setupDragAndDrop() {
+      const uploadArea = document.getElementById('upload-area');
+      
+      if (uploadArea) {
+        ['dragover', 'dragenter'].forEach(eventName => {
+          uploadArea.addEventListener(eventName, (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+          });
+        });
+        
+        ['dragleave', 'drop'].forEach(eventName => {
+          uploadArea.addEventListener(eventName, (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+          });
+        });
+        
+        uploadArea.addEventListener('drop', (e) => {
+          const files = e.dataTransfer.files;
+          if (files.length > 0 && files[0].type.startsWith('video/')) {
+            const fileInput = document.getElementById('file-input');
+            fileInput.files = files;
+            window.handleVideoUpload({ target: { files: files } });
+          } else {
+            showErrorMessage('⚠️ Por favor, solte um arquivo de vídeo válido.');
+          }
+        });
+      }
+    }
+
+    // Handle orientation change and resize
+    function handleOrientationChange() {
+      setTimeout(() => {
+        adjustCanvasSize();
+        if (window.canvas) {
+          resizeCanvas(canvasWidth, canvasHeight);
+        }
+      }, 500);
+    }
+
+    // Initialize when page loads
+    window.addEventListener('load', function() {
+      setupDragAndDrop();
+      
+      if (isMobile) {
+        window.addEventListener('orientationchange', handleOrientationChange);
+        window.addEventListener('resize', handleOrientationChange);
+        
+        // Prevent bounce scrolling on iOS
+        document.addEventListener('touchmove', function(e) {
+          e.preventDefault();
+        }, { passive: false });
+      }
+    });
+
+    // p5.js functions
+    function setup() {
+      let canvas = createCanvas(canvasWidth, canvasHeight);
+      canvas.parent('canvas-container');
+      
+      pixelDensity(1);
+      frameRate(isMobile ? 12 : 25); // Optimized for mobile
+      
+      background(0);
+      fill(255);
+      textAlign(CENTER, CENTER);
+      textSize(14);
+      text('Aguardando inicialização...', width/2, height/2);
+    }
+
+    function draw() {
+      if (!isAppStarted) {
+        background(0);
+        fill(255);
+        textAlign(CENTER, CENTER);
+        textSize(12);
+        text('Pressione "Começar"', width/2, height/2);
+        return;
+      }
+      
+      background(0);
+      
+      let currentFrame = getCurrentFrame();
+      
+      if (!currentFrame) {
+        drawWaitingMessage();
+        return;
+      }
+      
+      // Display current frame
+      image(currentFrame, 0, 0, width, height);
+      
+      // Motion detection (optimized)
+      if (previousFrame && frameCount % (isMobile ? 8 : 4) === 0) {
+        detectMotion(currentFrame);
+      }
+      
+      // Store frame for comparison
+      if (frameCount % (isMobile ? 8 : 4) === 0) {
+        previousFrame = currentFrame.get();
+      }
+    }
+
+    function getCurrentFrame() {
+      if (currentSource === 'webcam' && capture && capture.elt && capture.elt.videoWidth > 0) {
+        return capture;
+      } else if (currentSource === 'video' && uploadedVideo && uploadedVideo.elt && uploadedVideo.elt.videoWidth > 0) {
+        return uploadedVideo;
+      }
+      return null;
+    }
+
+    function drawWaitingMessage() {
+      fill(255);
+      textAlign(CENTER, CENTER);
+      textSize(12);
+      
+      if (currentSource === 'webcam' && cameraPermissionDenied) {
+        text('Câmera não disponível\nTente "Upload Vídeo"', width/2, height/2);
+      } else {
+        text('Aguardando fonte de vídeo...', width/2, height/2);
+      }
+    }
+
+    function detectMotion(currentFrame) {
+      if (!currentFrame || !previousFrame) return;
+      
+      currentFrame.loadPixels();
+      previousFrame.loadPixels();
+      
+      let motionCount = 0;
+      let totalPixels = 0;
+      let step = isMobile ? 16 : 10; // Bigger steps on mobile
+      
+      // More efficient pixel checking
+      for (let x = step; x < currentFrame.width - step; x += step) {
+        for (let y = step; y < currentFrame.height - step; y += step) {
+          let loc = (x + y * currentFrame.width) * 4;
+          
+          if (loc >= 0 && loc < currentFrame.pixels.length - 3) {
+            let r1 = currentFrame.pixels[loc];
+            let g1 = currentFrame.pixels[loc + 1];
+            let b1 = currentFrame.pixels[loc + 2];
+            
+            let r2 = previousFrame.pixels[loc];
+            let g2 = previousFrame.pixels[loc + 1];
+            let b2 = previousFrame.pixels[loc + 2];
+            
+            let diff = dist(r1, g1, b1, r2, g2, b2);
+            
+            if (diff > motionThreshold) {
+              motionCount++;
+              
+              // Draw motion indicator
+              let canvasX = map(x, 0, currentFrame.width, 0, width);
+              let canvasY = map(y, 0, currentFrame.height, 0, height);
+              
+              fill(255, 50, 50, 100);
+              noStroke();
+              ellipse(canvasX, canvasY, step * 0.8);
+            }
+            
+            totalPixels++;
+          }
+        }
+      }
+      
+      // Calculate and display motion percentage
+      let motionPercentage = totalPixels > 0 ? (motionCount / totalPixels) * 100 : 0;
+      
+      // Motion info display
+      fill(0, 0, 0, 120);
+      noStroke();
+      rect(3, 3, Math.min(width - 6, 180), 40);
+      
+      fill(255, 255, 100);
+      textAlign(LEFT, TOP);
+      textSize(isMobile ? 10 : 12);
+      text(`Movimento: ${motionPercentage.toFixed(1)}%`, 6, 8);
+      
+      // Status indicator
+      fill(motionPercentage > 3 ? color(255, 100, 100) : color(100, 255, 100));
+      text(motionPercentage > 3 ? 'DETECTADO!' : 'Normal', 6, 22);
+    }
+
+    function windowResized() {
+      adjustCanvasSize();
+      resizeCanvas(canvasWidth, canvasHeight);
+    }
+
+    // Cleanup on page unload
+    window.addEventListener('beforeunload', function() {
+      stopCamera();
+    });
+  </script>
+  
+  <style>
+    /* Reset and mobile-first approach */
+    *, *::before, *::after {
+      box-sizing: border-box;
+      touch-action: manipulation;
+      -webkit-tap-highlight-color: transparent;
+    }
+    
+    html {
+      scroll-behavior: smooth;
+      -webkit-text-size-adjust: 100%;
+      -webkit-font-smoothing: antialiased;
+      height: 100%;
+      width: 100%;
+      overflow-x: hidden;
+    }
+    
+    body {
+      background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 40%, #60a5fa 70%, #93c5fd 100%);
+      min-height: 100vh;
+      min-height: -webkit-fill-available;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      margin: 0;
+      padding: env(safe-area-inset-top, 10px) env(safe-area-inset-right, 10px) env(safe-area-inset-bottom, 10px) env(safe-area-inset-left, 10px);
+      overflow-x: hidden;
+      user-select: none;
+      width: 100%;
+      background-attachment: fixed;
+      
+      /* Prevent overscroll bounce on iOS */
+      overscroll-behavior: none;
+      -webkit-overflow-scrolling: touch;
+    }
+    
+    .main-container {
+      width: 100%;
+      max-width: 900px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 15px;
+      flex: 1;
+    }
+    
+    h1 {
+      color: white;
+      font-size: clamp(1.5rem, 5vw, 2.5rem);
+      font-weight: 900;
+      text-align: center;
+      margin-bottom: 0.8rem;
+      text-shadow: 2px 2px 10px rgba(0, 0, 0, 0.5);
+    }
+    
+    p {
+      color: rgba(255, 255, 255, 0.9);
+      font-size: clamp(0.8rem, 3vw, 1rem);
+      text-align: center;
+      margin-bottom: 1rem;
+      text-shadow: 1px 1px 5px rgba(0, 0, 0, 0.3);
+      line-height: 1.4;
+      padding: 0 10px;
+    }
+    
+    #status {
+      color: white;
+      font-size: clamp(0.8rem, 3vw, 1rem);
+      font-weight: 600;
+      text-align: center;
+      margin-bottom: 1rem;
+      padding: 10px 15px;
+      background: rgba(0, 0, 0, 0.3);
+      border-radius: 10px;
+      backdrop-filter: blur(8px);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 42px;
+      max-width: 100%;
+      word-break: break-word;
+    }
+    
+    /* Canvas styling */
+    canvas {
+      border: 2px solid rgba(255, 255, 255, 0.8);
+      border-radius: 8px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+      max-width: 100%;
+      height: auto;
+      display: block;
+      background: #000;
+      transform: translateZ(0);
+      /* Improve rendering on mobile */
+      image-rendering: -webkit-optimize-contrast;
+      image-rendering: crisp-edges;
+    }
+    
+    /* Status indicators */
+    .status-indicator {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      margin-right: 6px;
+      animation: pulse 2s infinite;
+      flex-shrink: 0;
+    }
+    
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.7; transform: scale(1.1); }
+    }
+    
+    .status-loading { 
+      background: linear-gradient(45deg, #ffd700, #ffed4e);
+      box-shadow: 0 0 4px rgba(255, 215, 0, 0.5);
+    }
+    .status-ready { 
+      background: linear-gradient(45deg, #00ff88, #32ff99);
+      box-shadow: 0 0 4px rgba(0, 255, 136, 0.5);
+    }
+    .status-error { 
+      background: linear-gradient(45deg, #ff4444, #ff6666);
+      box-shadow: 0 0 4px rgba(255, 68, 68, 0.5);
+    }
+    
+    /* Buttons */
+    .source-tabs {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 15px;
+      width: 100%;
+      max-width: 400px;
+    }
+    
+    .tab-button {
+      flex: 1;
+      padding: 12px 16px;
+      background: rgba(255, 255, 255, 0.15);
+      border: 2px solid rgba(255, 255, 255, 0.3);
+      border-radius: 10px;
+      color: white;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      font-size: clamp(0.8rem, 3vw, 1rem);
+      font-weight: 700;
+      min-height: 46px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      backdrop-filter: blur(6px);
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    
+    .tab-button:active {
+      transform: scale(0.95);
+      background: rgba(255, 255, 255, 0.25);
+    }
+    
+    .tab-button.active {
+      background: rgba(0, 255, 136, 0.2);
+      border-color: #00ff88;
+      box-shadow: 0 0 15px rgba(0, 255, 136, 0.3);
+      color: #ffffff;
+    }
+    
+    /* Upload area */
+    #video-upload-section {
+      display: none;
+      margin-bottom: 15px;
+      width: 100%;
+      animation: fadeIn 0.5s ease-out;
+    }
+    
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(20px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    
+    .upload-area {
+      border: 2px dashed rgba(255, 255, 255, 0.6);
+      border-radius: 10px;
+      padding: 25px 15px;
+      text-align: center;
+      background: rgba(255, 255, 255, 0.1);
+      cursor: pointer;
+      transition: all 0.3s ease;
+      width: 100%;
+      min-height: 100px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      backdrop-filter: blur(8px);
+      color: white;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    
+    .upload-area:active {
+      transform: scale(0.98);
+      background: rgba(255, 255, 255, 0.2);
+    }
+    
+    .upload-area.dragover {
+      border-color: #00ff88;
+      background: rgba(0, 255, 136, 0.15);
+      box-shadow: 0 0 20px rgba(0, 255, 136, 0.3);
+      transform: scale(1.02);
+    }
+    
+    .upload-area p {
+      margin: 5px 0;
+      font-size: clamp(0.8rem, 3vw, 1rem);
+    }
+    
+    #file-input {
+      display: none;
+    }
+    
+    /* Video controls */
+    .video-controls {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      justify-content: center;
+      margin-top: 15px;
+      flex-wrap: wrap;
+      width: 100%;
+      max-width: 350px;
+    }
+    
+    .control-button {
+      flex: 1;
+      min-width: 90px;
+      max-width: 150px;
+      padding: 10px 16px;
+      background: linear-gradient(135deg, rgba(59, 130, 246, 0.9), rgba(99, 162, 255, 0.9));
+      border: none;
+      border-radius: 10px;
+      color: white;
+      cursor: pointer;
+      font-weight: 700;
+      font-size: clamp(0.8rem, 3vw, 0.9rem);
+      transition: all 0.3s ease;
+      min-height: 44px;
+      backdrop-filter: blur(6px);
+      box-shadow: 0 2px 10px rgba(59, 130, 246, 0.3);
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    
+    .control-button:active {
+      transform: scale(0.95);
+      background: linear-gradient(135deg, rgba(59, 130, 246, 1), rgba(99, 162, 255, 1));
+    }
+    
+    .control-button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      transform: none;
+      background: rgba(128, 128, 128, 0.5);
+    }
+    
+    /* Messages */
+    .error-message, .info-message {
+      border-radius: 10px;
+      padding: 15px;
+      margin: 10px 0;
+      backdrop-filter: blur(6px);
+      color: white;
+      text-align: center;
+      font-size: clamp(0.8rem, 3vw, 0.9rem);
+      line-height: 1.4;
+      word-wrap: break-word;
+    }
+    
+    .error-message {
+      background: rgba(255, 68, 68, 0.15);
+      border: 1px solid rgba(255, 68, 68, 0.3);
+      box-shadow: 0 2px 15px rgba(255, 68, 68, 0.2);
+    }
+    
+    .info-message {
+      background: rgba(0, 255, 136, 0.15);
+      border: 1px solid rgba(0, 255, 136, 0.3);
+      box-shadow: 0 2px 15px rgba(0, 255, 136, 0.2);
+    }
+    
+    .info-message h3 {
+      margin: 0 0 10px 0;
+      color: #00ff88;
+      font-size: clamp(1rem, 4vw, 1.2rem);
+    }
+    
+    .help-button {
+      padding: 10px 16px;
+      border: none;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: clamp(0.8rem, 3vw, 0.9rem);
+      cursor: pointer;
+      transition: all 0.3s ease;
+      min-height: 42px;
+      margin: 5px;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    
+    .help-button.primary {
+      background: linear-gradient(135deg, #00ff88, #32ff99);
+      color: #000;
+    }
+    
+    .help-button.secondary {
+      background: linear-gradient(135deg, rgba(59, 130, 246, 0.9), rgba(99, 162, 255, 0.9));
+      color: white;
+    }
+    
+    .help-button:active {
+      transform: scale(0.95);
+    }
+    
+    /* Welcome screen */
+    .welcome-screen {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 40%, #60a5fa 70%, #93c5fd 100%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 2000;
+      padding: 20px;
+      overflow: hidden;
+    }
+    
+    .welcome-screen.hidden {
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.5s ease-out;
+    }
+    
+    .welcome-title {
+      font-size: clamp(2rem, 8vw, 4rem);
+      font-weight: 900;
+      color: white;
+      text-align: center;
+      margin-bottom: 1.5rem;
+      text-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+      animation: slideInUp 1s ease-out 0.3s both;
+    }
+    
+    .welcome-subtitle {
+      font-size: clamp(0.9rem, 3vw, 1.3rem);
+      color: rgba(255, 255, 255, 0.9);
+      text-align: center;
+      margin-bottom: 2.5rem;
+      max-width: 600px;
+      line-height: 1.4;
+      animation: slideInUp 1s ease-out 0.5s both;
+      text-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+    }
+    
+    .welcome-button {
+      background: linear-gradient(135deg, #00ff88 0%, #32cd32 50%, #00cc00 100%);
+      color: #000;
+      font-size: clamp(1rem, 4vw, 1.3rem);
+      font-weight: 800;
+      padding: 16px 32px;
+      border: none;
+      border-radius: 20px;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      box-shadow: 0 6px 25px rgba(0, 255, 136, 0.4);
+      animation: slideInUp 1s ease-out 0.7s both;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      min-width: 180px;
+      min-height: 56px;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    
+    .welcome-button:active {
+      transform: scale(0.95);
+      box-shadow: 0 8px 30px rgba(0, 255, 136, 0.6);
+    }
+    
+    .welcome-icon {
+      font-size: clamp(3rem, 10vw, 6rem);
+      margin-bottom: 1.5rem;
+      animation: float 3s ease-in-out infinite;
+      filter: drop-shadow(0 4px 20px rgba(0, 0, 0, 0.3));
+    }
+    
+    @keyframes slideInUp {
+      from {
+        opacity: 0;
+        transform: translateY(30px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+    
+    @keyframes float {
+      0%, 100% { transform: translateY(0px); }
+      50% { transform: translateY(-8px); }
+    }
+    
+    /* Mobile-specific optimizations */
+    @media screen and (max-width: 768px) {
+      .main-container {
+        padding: 10px;
+      }
+      
+      .source-tabs {
+        gap: 6px;
+      }
+      
+      .video-controls {
+        gap: 6px;
+      }
+      
+      .help-button {
+        flex: 1;
+        min-width: 80px;
+      }
+      
+      /* Improve touch targets */
+      .tab-button,
+      .control-button,
+      .upload-area,
+      .help-button {
+        min-height: 44px; /* iOS recommendation */
+      }
+    }
+    
+    @media screen and (max-width: 480px) {
+      .main-container {
+        padding: 8px;
+      }
+      
+      #status {
+        padding: 8px 12px;
+        font-size: 0.8rem;
+      }
+      
+      .welcome-screen {
+        padding: 15px;
+      }
+      
+      .error-message, .info-message {
+        padding: 12px;
+        font-size: 0.8rem;
+      }
+    }
+    
+    /* Landscape mode adjustments for mobile */
+    @media screen and (orientation: landscape) and (max-height: 500px) {
+      .welcome-screen {
+        padding: 10px;
+      }
+      
+      .welcome-title {
+        margin-bottom: 1rem;
+      }
+      
+      .welcome-subtitle {
+        margin-bottom: 1.5rem;
+      }
+      
+      .welcome-icon {
+        margin-bottom: 1rem;
+      }
+    }
+    
+    /* High DPI displays */
+    @media (-webkit-min-device-pixel-ratio: 2), (min-resolution: 192dpi) {
+      canvas {
+        image-rendering: auto;
+      }
+    }
+    
+    /* Dark mode support */
+    @media (prefers-color-scheme: dark) {
+      .status-indicator {
+        filter: brightness(1.1);
+      }
+    }
+    
+    /* Reduced motion support */
+    @media (prefers-reduced-motion: reduce) {
+      .status-indicator,
+      .welcome-icon {
+        animation: none;
+      }
+      
+      .welcome-title,
+      .welcome-subtitle,
+      .welcome-button {
+        animation: none;
+        opacity: 1;
+        transform: translateY(0);
+      }
+      
+      * {
+        transition-duration: 0.1s !important;
+      }
+    }
+    
+    /* Focus styles for accessibility */
+    .tab-button:focus,
+    .control-button:focus,
+    .help-button:focus,
+    .welcome-button:focus,
+    .upload-area:focus {
+      outline: 2px solid #00ff88;
+      outline-offset: 2px;
+    }
+    
+    /* Ensure text remains readable */
+    @media screen and (max-width: 320px) {
+      h1 {
+        font-size: 1.3rem;
+      }
+      
+      p {
+        font-size: 0.8rem;
+      }
+      
+      .tab-button,
+      .control-button {
+        font-size: 0.7rem;
+        padding: 10px 12px;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <!-- Welcome Screen -->
+  <div class="welcome-screen" id="welcomeScreen">
+    <div class="welcome-icon">📹</div>
+    <h1 class="welcome-title">Motion Detector</h1>
+    <p class="welcome-subtitle">
+      Detecte movimento em tempo real usando sua webcam ou vídeos carregados.<br>
+      <strong>📹 100% no navegador - seguro e sem instalação!</strong><br>
+      <em>⚡ Otimizado especialmente para dispositivos móveis</em>
+    </p>
+    <button class="welcome-button" onclick="startApp()">Começar</button>
+  </div>
+
+  <!-- Main Application -->
+  <div class="main-container">
+    <h1>🎯 Motion Detector</h1>
+    
+    <p>
+      🎯 Detecte movimento em tempo real com sua webcam ou carregue um vídeo<br>
+      <span style="font-size: 0.8em; opacity: 0.8;">💡 Permita acesso à câmera quando solicitado</span>
+    </p>
+    
+    <div id="status">
+      <span class="status-indicator status-loading"></span>
+      Carregando aplicação...
+    </div>
+    
+    <!-- Source selection tabs -->
+    <div class="source-tabs">
+      <button class="tab-button active" id="webcam-tab" onclick="switchSource('webcam')">
+        📷 Webcam
+      </button>
+      <button class="tab-button" id="video-tab" onclick="switchSource('video')">
+        🎬 Upload
+      </button>
+    </div>
+    
+    <!-- Video upload section -->
+    <div id="video-upload-section">
+      <div class="upload-area" id="upload-area" onclick="document.getElementById('file-input').click()">
+        <div style="font-size: 2.5rem; margin-bottom: 0.8rem;">📁</div>
+        <p style="font-weight: 600; margin-bottom: 0.3rem;">
+          Toque aqui ou arraste um vídeo
+        </p>
+        <p style="opacity: 0.8; font-size: 0.8rem;">
+          MP4, WebM, AVI, MOV
+        </p>
+      </div>
+      <input type="file" id="file-input" accept="video/*" onchange="handleVideoUpload(event)">
+    </div>
+    
+    <!-- Video controls -->
+    <div class="video-controls" id="video-controls" style="display: none;">
+      <button class="control-button" id="play-pause-btn" onclick="togglePlayPause()">
+        ▶️ Play
+      </button>
+      <button class="control-button" onclick="restartVideo()">
+        🔄 Reiniciar
+      </button>
+    </div>
+    
+    <!-- Canvas container -->
+    <div id="canvas-container" style="margin: 15px 0;"></div>
+    
+    <!-- Error message container -->
+    <div id="error-container"></div>
+  </div>
+</body>
+</html>

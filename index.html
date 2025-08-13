@@ -39,6 +39,7 @@
     let cameraAttempts = 0;
     let maxCameraAttempts = 3;
     let mediaStream = null;
+    let motionBoxes = [];
 
     // Check if HTTPS is required
     function checkHTTPS() {
@@ -556,8 +557,11 @@
       
       // Motion detection (optimized)
       if (previousFrame && frameCount % (isMobile ? 8 : 4) === 0) {
-        detectMotion(currentFrame);
+        detectMotionBoxes(currentFrame);
       }
+      
+      // Draw motion boxes
+      drawMotionBoxes();
       
       // Store frame for comparison
       if (frameCount % (isMobile ? 8 : 4) === 0) {
@@ -586,65 +590,169 @@
       }
     }
 
-    function detectMotion(currentFrame) {
+    function detectMotionBoxes(currentFrame) {
       if (!currentFrame || !previousFrame) return;
       
       currentFrame.loadPixels();
       previousFrame.loadPixels();
       
-      let motionCount = 0;
-      let totalPixels = 0;
-      let step = isMobile ? 16 : 10; // Bigger steps on mobile
+      let motionGrid = [];
+      let gridSize = isMobile ? 20 : 16;
+      let gridCols = Math.floor(currentFrame.width / gridSize);
+      let gridRows = Math.floor(currentFrame.height / gridSize);
       
-      // More efficient pixel checking
-      for (let x = step; x < currentFrame.width - step; x += step) {
-        for (let y = step; y < currentFrame.height - step; y += step) {
-          let loc = (x + y * currentFrame.width) * 4;
-          
-          if (loc >= 0 && loc < currentFrame.pixels.length - 3) {
-            let r1 = currentFrame.pixels[loc];
-            let g1 = currentFrame.pixels[loc + 1];
-            let b1 = currentFrame.pixels[loc + 2];
-            
-            let r2 = previousFrame.pixels[loc];
-            let g2 = previousFrame.pixels[loc + 1];
-            let b2 = previousFrame.pixels[loc + 2];
-            
-            let diff = dist(r1, g1, b1, r2, g2, b2);
-            
-            if (diff > motionThreshold) {
-              motionCount++;
-              
-              // Draw motion indicator
-              let canvasX = map(x, 0, currentFrame.width, 0, width);
-              let canvasY = map(y, 0, currentFrame.height, 0, height);
-              
-              fill(255, 50, 50, 100);
-              noStroke();
-              ellipse(canvasX, canvasY, step * 0.8);
-            }
-            
-            totalPixels++;
-          }
+      // Initialize motion grid
+      for (let x = 0; x < gridCols; x++) {
+        motionGrid[x] = [];
+        for (let y = 0; y < gridRows; y++) {
+          motionGrid[x][y] = false;
         }
       }
       
-      // Calculate and display motion percentage
-      let motionPercentage = totalPixels > 0 ? (motionCount / totalPixels) * 100 : 0;
+      // Detect motion in grid cells
+      for (let x = 0; x < gridCols; x++) {
+        for (let y = 0; y < gridRows; y++) {
+          let motionCount = 0;
+          let totalPixels = 0;
+          
+          // Check pixels in this grid cell
+          for (let px = x * gridSize; px < min((x + 1) * gridSize, currentFrame.width); px += 4) {
+            for (let py = y * gridSize; py < min((y + 1) * gridSize, currentFrame.height); py += 4) {
+              let loc = (px + py * currentFrame.width) * 4;
+              
+              if (loc >= 0 && loc < currentFrame.pixels.length - 3) {
+                let r1 = currentFrame.pixels[loc];
+                let g1 = currentFrame.pixels[loc + 1];
+                let b1 = currentFrame.pixels[loc + 2];
+                
+                let r2 = previousFrame.pixels[loc];
+                let g2 = previousFrame.pixels[loc + 1];
+                let b2 = previousFrame.pixels[loc + 2];
+                
+                let diff = dist(r1, g1, b1, r2, g2, b2);
+                
+                if (diff > motionThreshold) {
+                  motionCount++;
+                }
+                totalPixels++;
+              }
+            }
+          }
+          
+          // Mark cell as having motion if enough pixels changed
+          let motionPercentage = totalPixels > 0 ? (motionCount / totalPixels) * 100 : 0;
+          motionGrid[x][y] = motionPercentage > 15; // Threshold for motion in cell
+        }
+      }
       
-      // Motion info display
+      // Find connected regions and create bounding boxes
+      motionBoxes = [];
+      let visited = [];
+      
+      // Initialize visited grid
+      for (let x = 0; x < gridCols; x++) {
+        visited[x] = [];
+        for (let y = 0; y < gridRows; y++) {
+          visited[x][y] = false;
+        }
+      }
+      
+      // Find connected components
+      for (let x = 0; x < gridCols; x++) {
+        for (let y = 0; y < gridRows; y++) {
+          if (motionGrid[x][y] && !visited[x][y]) {
+            let region = floodFill(motionGrid, visited, x, y, gridCols, gridRows);
+            
+            if (region.length > 2) { // Only create boxes for regions with multiple cells
+              let bounds = getBoundingBox(region, gridSize);
+              motionBoxes.push(bounds);
+            }
+          }
+        }
+      }
+    }
+
+    function floodFill(grid, visited, startX, startY, cols, rows) {
+      let region = [];
+      let stack = [{x: startX, y: startY}];
+      
+      while (stack.length > 0) {
+        let cell = stack.pop();
+        let x = cell.x;
+        let y = cell.y;
+        
+        if (x < 0 || x >= cols || y < 0 || y >= rows || visited[x][y] || !grid[x][y]) {
+          continue;
+        }
+        
+        visited[x][y] = true;
+        region.push({x: x, y: y});
+        
+        // Add neighboring cells
+        stack.push({x: x + 1, y: y});
+        stack.push({x: x - 1, y: y});
+        stack.push({x: x, y: y + 1});
+        stack.push({x: x, y: y - 1});
+      }
+      
+      return region;
+    }
+
+    function getBoundingBox(region, gridSize) {
+      let minX = region[0].x;
+      let maxX = region[0].x;
+      let minY = region[0].y;
+      let maxY = region[0].y;
+      
+      for (let cell of region) {
+        minX = min(minX, cell.x);
+        maxX = max(maxX, cell.x);
+        minY = min(minY, cell.y);
+        maxY = max(maxY, cell.y);
+      }
+      
+      return {
+        x: minX * gridSize,
+        y: minY * gridSize,
+        width: (maxX - minX + 1) * gridSize,
+        height: (maxY - minY + 1) * gridSize
+      };
+    }
+
+    function drawMotionBoxes() {
+      // Draw green bounding boxes
+      stroke(0, 255, 100); // Green color
+      strokeWeight(3);
+      fill(0, 255, 100, 30); // Semi-transparent green fill
+      
+      for (let box of motionBoxes) {
+        let canvasX = map(box.x, 0, getCurrentFrame()?.width || width, 0, width);
+        let canvasY = map(box.y, 0, getCurrentFrame()?.height || height, 0, height);
+        let canvasW = map(box.width, 0, getCurrentFrame()?.width || width, 0, width);
+        let canvasH = map(box.height, 0, getCurrentFrame()?.height || height, 0, height);
+        
+        // Add some padding to the box
+        canvasX = max(0, canvasX - 5);
+        canvasY = max(0, canvasY - 5);
+        canvasW = min(width - canvasX, canvasW + 10);
+        canvasH = min(height - canvasY, canvasH + 10);
+        
+        rect(canvasX, canvasY, canvasW, canvasH);
+      }
+      
+      // Display motion info
       fill(0, 0, 0, 120);
       noStroke();
-      rect(3, 3, Math.min(width - 6, 180), 40);
+      rect(3, 3, Math.min(width - 6, 200), 40);
       
       fill(255, 255, 100);
       textAlign(LEFT, TOP);
       textSize(isMobile ? 10 : 12);
-      text(`Movimento: ${motionPercentage.toFixed(1)}%`, 6, 8);
+      text(`Objetos detectados: ${motionBoxes.length}`, 6, 8);
       
       // Status indicator
-      fill(motionPercentage > 3 ? color(255, 100, 100) : color(100, 255, 100));
-      text(motionPercentage > 3 ? 'DETECTADO!' : 'Normal', 6, 22);
+      fill(motionBoxes.length > 0 ? color(0, 255, 100) : color(100, 255, 100));
+      text(motionBoxes.length > 0 ? 'MOVIMENTO DETECTADO!' : 'Sem movimento', 6, 22);
     }
 
     function windowResized() {
@@ -1206,75 +1314,3 @@
         padding: 10px 12px;
       }
     }
-  </style>
-</head>
-
-<body>
-  <!-- Welcome Screen -->
-  <div class="welcome-screen" id="welcomeScreen">
-    <div class="welcome-icon">📹</div>
-    <h1 class="welcome-title">Motion Detector</h1>
-    <p class="welcome-subtitle">
-      Detecte movimento em tempo real usando sua webcam ou vídeos carregados.<br>
-      <strong>📹 100% no navegador - seguro e sem instalação!</strong><br>
-      <em>⚡ Otimizado especialmente para dispositivos móveis</em>
-    </p>
-    <button class="welcome-button" onclick="startApp()">Começar</button>
-  </div>
-
-  <!-- Main Application -->
-  <div class="main-container">
-    <h1>🎯 Motion Detector</h1>
-    
-    <p>
-      🎯 Detecte movimento em tempo real com sua webcam ou carregue um vídeo<br>
-      <span style="font-size: 0.8em; opacity: 0.8;">💡 Permita acesso à câmera quando solicitado</span>
-    </p>
-    
-    <div id="status">
-      <span class="status-indicator status-loading"></span>
-      Carregando aplicação...
-    </div>
-    
-    <!-- Source selection tabs -->
-    <div class="source-tabs">
-      <button class="tab-button active" id="webcam-tab" onclick="switchSource('webcam')">
-        📷 Webcam
-      </button>
-      <button class="tab-button" id="video-tab" onclick="switchSource('video')">
-        🎬 Upload
-      </button>
-    </div>
-    
-    <!-- Video upload section -->
-    <div id="video-upload-section">
-      <div class="upload-area" id="upload-area" onclick="document.getElementById('file-input').click()">
-        <div style="font-size: 2.5rem; margin-bottom: 0.8rem;">📁</div>
-        <p style="font-weight: 600; margin-bottom: 0.3rem;">
-          Toque aqui ou arraste um vídeo
-        </p>
-        <p style="opacity: 0.8; font-size: 0.8rem;">
-          MP4, WebM, AVI, MOV
-        </p>
-      </div>
-      <input type="file" id="file-input" accept="video/*" onchange="handleVideoUpload(event)">
-    </div>
-    
-    <!-- Video controls -->
-    <div class="video-controls" id="video-controls" style="display: none;">
-      <button class="control-button" id="play-pause-btn" onclick="togglePlayPause()">
-        ▶️ Play
-      </button>
-      <button class="control-button" onclick="restartVideo()">
-        🔄 Reiniciar
-      </button>
-    </div>
-    
-    <!-- Canvas container -->
-    <div id="canvas-container" style="margin: 15px 0;"></div>
-    
-    <!-- Error message container -->
-    <div id="error-container"></div>
-  </div>
-</body>
-</html>
